@@ -14,11 +14,11 @@ namespace HandRehab.Tracking
     /// <summary>
     /// Opens the webcam, shows it (mirrored, like a selfie view) on a RawImage and runs the
     /// MediaPipe Hand Landmarker on every new camera frame in LIVE_STREAM mode.
-    /// Results arrive on a MediaPipe thread; they are copied and handed out on the main thread.
+    /// Results arrive on a MediaPipe thread; they are copied, then smoothed and handed out on the main thread.
     /// </summary>
     public sealed class MediaPipeHandSource : MonoBehaviour, IHandSource
     {
-        public enum HandPreference { Any, LeftOnly, RightOnly }
+        public enum TrainingHandMode { Auto, Left, Right }
 
         [Header("Camera")]
         [Tooltip("Leave empty to use the first webcam found.")]
@@ -41,19 +41,32 @@ namespace HandRehab.Tracking
         [SerializeField, Range(0f, 1f)] private float minPresenceConfidence = 0.5f;
         [SerializeField, Range(0f, 1f)] private float minTrackingConfidence = 0.5f;
 
-        [Header("Hand selection")]
-        [Tooltip("Track only the patient's affected hand, or whichever hand is seen.")]
-        [SerializeField] private HandPreference handPreference = HandPreference.Any;
-        [Tooltip("Tick if Left/Right come out reversed on your setup.")]
+        [Header("Which hand")]
+        [Tooltip("Left/Right: the patient's training hand. Any hand seen is treated as that hand, so the label never flickers. " +
+                 "Auto: use MediaPipe's label, smoothed over time.")]
+        [SerializeField] private TrainingHandMode trainingHand = TrainingHandMode.Auto;
+        [Tooltip("Auto mode only: how quickly the label follows MediaPipe (0..1). Lower = steadier.")]
+        [SerializeField, Range(0.02f, 1f)] private float handednessSmoothing = 0.15f;
+        [Tooltip("Tick if MediaPipe's Left/Right come out reversed on your setup.")]
         [SerializeField] private bool swapHandedness = false;
         [Tooltip("Seconds without a detection before the hand counts as lost.")]
         [SerializeField] private float lostAfterSeconds = 0.25f;
+
+        [Header("Smoothing (One Euro filter)")]
+        [SerializeField] private bool smoothLandmarks = true;
+        [Tooltip("Lower = less jitter when the hand is still.")]
+        [SerializeField] private float minCutoff = 1.5f;
+        [Tooltip("Higher = less lag during fast movement (image points).")]
+        [SerializeField] private float betaImage = 10f;
+        [Tooltip("Higher = less lag during fast movement (3D points, metres).")]
+        [SerializeField] private float betaWorld = 50f;
 
         public event Action<HandFrame> FrameReady;
         public event Action HandLost;
 
         public bool IsTracking { get; private set; }
         public HandFrame LatestFrame { get; private set; }
+        public TrainingHandMode TrainingHand => trainingHand;
 
         /// <summary>Tracking results per second (for the debug panel).</summary>
         public float ResultsPerSecond { get; private set; }
@@ -72,8 +85,14 @@ namespace HandRehab.Tracking
         private bool _hasPendingFrame;
         private int _resultsSinceLastSecond;
 
+        // Main-thread state.
         private double _lastSeenTime = double.NegativeInfinity;
         private float _rateTimer;
+        private OneEuroFilterVector3[] _imageFilters;
+        private OneEuroFilterVector3[] _worldFilters;
+        private bool _hasHandState;
+        private float _rightness;              // 0 = surely left, 1 = surely right (Auto mode)
+        private Handedness _stableHandedness;
 
         private IEnumerator Start()
         {
@@ -82,6 +101,8 @@ namespace HandRehab.Tracking
                 Fail("No model assigned. Drag hand_landmarker.bytes into 'Model Asset'.");
                 yield break;
             }
+
+            CreateFilters();
 
             // 1. Open the webcam.
             var devices = WebCamTexture.devices;
@@ -186,62 +207,72 @@ namespace HandRehab.Tracking
                 return;
             }
 
-            for (var h = 0; h < result.handLandmarks.Count; h++)
+            // Pick one hand: with a fixed training hand prefer the hand MediaPipe labels the same,
+            // otherwise (or if none matches) take the first hand.
+            var chosen = 0;
+            if (trainingHand != TrainingHandMode.Auto && result.handLandmarks.Count > 1)
             {
-                var handedness = Handedness.Unknown;
-                var confidence = 0f;
-                if (result.handedness != null && h < result.handedness.Count && result.handedness[h].categories?.Count > 0)
+                var wanted = trainingHand == TrainingHandMode.Left ? Handedness.Left : Handedness.Right;
+                for (var h = 0; h < result.handLandmarks.Count; h++)
                 {
-                    var category = result.handedness[h].categories[0];
-                    confidence = category.score;
-                    handedness = category.categoryName == "Left" ? Handedness.Left
-                               : category.categoryName == "Right" ? Handedness.Right
-                               : Handedness.Unknown;
-                    if (swapHandedness && handedness != Handedness.Unknown)
-                    {
-                        handedness = handedness == Handedness.Left ? Handedness.Right : Handedness.Left;
-                    }
+                    if (ReadLabel(result, h, out _) == wanted) { chosen = h; break; }
                 }
-
-                if (handPreference == HandPreference.LeftOnly && handedness != Handedness.Left) continue;
-                if (handPreference == HandPreference.RightOnly && handedness != Handedness.Right) continue;
-
-                var normalized = result.handLandmarks[h].landmarks;
-                if (normalized == null || normalized.Count < HandFrame.LandmarkCount) continue;
-
-                var frame = new HandFrame
-                {
-                    Timestamp = timestampMs / 1000.0,
-                    Handedness = handedness,
-                    Confidence = confidence,
-                    ImagePoints = new Vector3[HandFrame.LandmarkCount],
-                    WorldPoints = new Vector3[HandFrame.LandmarkCount]
-                };
-
-                for (var i = 0; i < HandFrame.LandmarkCount; i++)
-                {
-                    var p = normalized[i];
-                    frame.ImagePoints[i] = new Vector3(p.x, p.y, p.z);
-                }
-
-                if (result.handWorldLandmarks != null && h < result.handWorldLandmarks.Count)
-                {
-                    var world = result.handWorldLandmarks[h].landmarks;
-                    for (var i = 0; i < HandFrame.LandmarkCount && i < world.Count; i++)
-                    {
-                        // MediaPipe y points down; Unity y points up.
-                        var p = world[i];
-                        frame.WorldPoints[i] = new Vector3(p.x, -p.y, p.z);
-                    }
-                }
-
-                lock (_lock)
-                {
-                    _pendingFrame = frame;
-                    _hasPendingFrame = true;
-                }
-                return; // first matching hand only
             }
+
+            var normalized = result.handLandmarks[chosen].landmarks;
+            if (normalized == null || normalized.Count < HandFrame.LandmarkCount) return;
+
+            var rawLabel = ReadLabel(result, chosen, out var score);
+            var frame = new HandFrame
+            {
+                Timestamp = timestampMs / 1000.0,
+                RawHandedness = rawLabel,
+                Handedness = rawLabel, // replaced on the main thread
+                Confidence = score,
+                ImagePoints = new Vector3[HandFrame.LandmarkCount],
+                WorldPoints = new Vector3[HandFrame.LandmarkCount]
+            };
+
+            for (var i = 0; i < HandFrame.LandmarkCount; i++)
+            {
+                var p = normalized[i];
+                frame.ImagePoints[i] = new Vector3(p.x, p.y, p.z);
+            }
+
+            if (result.handWorldLandmarks != null && chosen < result.handWorldLandmarks.Count)
+            {
+                var world = result.handWorldLandmarks[chosen].landmarks;
+                for (var i = 0; i < HandFrame.LandmarkCount && i < world.Count; i++)
+                {
+                    // MediaPipe y points down; Unity y points up.
+                    var p = world[i];
+                    frame.WorldPoints[i] = new Vector3(p.x, -p.y, p.z);
+                }
+            }
+
+            lock (_lock)
+            {
+                _pendingFrame = frame;
+                _hasPendingFrame = true;
+            }
+        }
+
+        private Handedness ReadLabel(HandLandmarkerResult result, int hand, out float score)
+        {
+            score = 0f;
+            if (result.handedness == null || hand >= result.handedness.Count) return Handedness.Unknown;
+            var categories = result.handedness[hand].categories;
+            if (categories == null || categories.Count == 0) return Handedness.Unknown;
+
+            score = categories[0].score;
+            var label = categories[0].categoryName == "Left" ? Handedness.Right
+                      : categories[0].categoryName == "Right" ? Handedness.Left
+                      : Handedness.Unknown;
+            if (swapHandedness && label != Handedness.Unknown)
+            {
+                label = label == Handedness.Left ? Handedness.Right : Handedness.Left;
+            }
+            return label;
         }
 
         private void Update()
@@ -266,6 +297,9 @@ namespace HandRehab.Tracking
 
             if (hasFrame)
             {
+                frame.Handedness = DecideHandedness(frame);
+                if (smoothLandmarks) Smooth(ref frame);
+
                 LatestFrame = frame;
                 IsTracking = true;
                 _lastSeenTime = Time.unscaledTimeAsDouble;
@@ -274,7 +308,66 @@ namespace HandRehab.Tracking
             else if (IsTracking && Time.unscaledTimeAsDouble - _lastSeenTime > lostAfterSeconds)
             {
                 IsTracking = false;
+                ResetHandState();
                 HandLost?.Invoke();
+            }
+        }
+
+        /// <summary>The stable label: the chosen training hand, or MediaPipe's label with hysteresis.</summary>
+        private Handedness DecideHandedness(in HandFrame frame)
+        {
+            if (trainingHand == TrainingHandMode.Left) return Handedness.Left;
+            if (trainingHand == TrainingHandMode.Right) return Handedness.Right;
+
+            // Turn this frame's label + score into a "rightness" vote: 1 = right, 0 = left.
+            var vote = frame.RawHandedness == Handedness.Right ? frame.Confidence
+                     : frame.RawHandedness == Handedness.Left ? 1f - frame.Confidence
+                     : 0.5f;
+
+            if (!_hasHandState)
+            {
+                _hasHandState = true;
+                _rightness = vote;
+                _stableHandedness = vote >= 0.5f ? Handedness.Right : Handedness.Left;
+                return _stableHandedness;
+            }
+
+            _rightness = Mathf.Lerp(_rightness, vote, handednessSmoothing);
+
+            // Hysteresis: only switch when the average is clearly on the other side.
+            if (_stableHandedness == Handedness.Left && _rightness > 0.7f) _stableHandedness = Handedness.Right;
+            else if (_stableHandedness == Handedness.Right && _rightness < 0.3f) _stableHandedness = Handedness.Left;
+            return _stableHandedness;
+        }
+
+        private void Smooth(ref HandFrame frame)
+        {
+            for (var i = 0; i < HandFrame.LandmarkCount; i++)
+            {
+                frame.ImagePoints[i] = _imageFilters[i].Filter(frame.ImagePoints[i], frame.Timestamp);
+                frame.WorldPoints[i] = _worldFilters[i].Filter(frame.WorldPoints[i], frame.Timestamp);
+            }
+        }
+
+        private void CreateFilters()
+        {
+            _imageFilters = new OneEuroFilterVector3[HandFrame.LandmarkCount];
+            _worldFilters = new OneEuroFilterVector3[HandFrame.LandmarkCount];
+            for (var i = 0; i < HandFrame.LandmarkCount; i++)
+            {
+                _imageFilters[i] = new OneEuroFilterVector3(minCutoff, betaImage);
+                _worldFilters[i] = new OneEuroFilterVector3(minCutoff, betaWorld);
+            }
+        }
+
+        private void ResetHandState()
+        {
+            _hasHandState = false;
+            if (_imageFilters == null) return;
+            for (var i = 0; i < HandFrame.LandmarkCount; i++)
+            {
+                _imageFilters[i].Reset();
+                _worldFilters[i].Reset();
             }
         }
 

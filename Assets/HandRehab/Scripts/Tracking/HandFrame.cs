@@ -20,10 +20,16 @@ namespace HandRehab.Tracking
         /// <summary>Seconds since tracking started.</summary>
         public double Timestamp;
 
-        /// <summary>Which hand this is, from the patient's point of view.</summary>
+        /// <summary>
+        /// Which hand this is, from the patient's point of view. This is the stable value to use:
+        /// the chosen training hand, or MediaPipe's label smoothed over time.
+        /// </summary>
         public Handedness Handedness;
 
-        /// <summary>Handedness classification score, 0..1.</summary>
+        /// <summary>MediaPipe's own label for this single frame (can flicker). For debugging.</summary>
+        public Handedness RawHandedness;
+
+        /// <summary>MediaPipe's score for RawHandedness, 0..1.</summary>
         public float Confidence;
 
         /// <summary>

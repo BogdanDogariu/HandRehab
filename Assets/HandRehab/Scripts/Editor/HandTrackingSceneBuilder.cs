@@ -62,7 +62,7 @@ namespace HandRehab.EditorTools
             textRect.SetParent(canvasGo.transform, false);
             textRect.anchorMin = textRect.anchorMax = textRect.pivot = new Vector2(0, 1);
             textRect.anchoredPosition = new Vector2(24, -24);
-            textRect.sizeDelta = new Vector2(620, 420);
+            textRect.sizeDelta = new Vector2(820, 560);
             var text = textGo.GetComponent<Text>();
             text.font = Resources.GetBuiltinResource<Font>("LegacyRuntime.ttf");
             text.fontSize = 26;
@@ -86,9 +86,15 @@ namespace HandRehab.EditorTools
             oso.FindProperty("handSourceBehaviour").objectReferenceValue = source;
             oso.ApplyModifiedPropertiesWithoutUndo();
 
+            var angles = trackingGo.AddComponent<HandAngleTracker>();
+            var aso = new SerializedObject(angles);
+            aso.FindProperty("handSourceBehaviour").objectReferenceValue = source;
+            aso.ApplyModifiedPropertiesWithoutUndo();
+
             var panel = trackingGo.AddComponent<HandTrackingDebugPanel>();
             var pso = new SerializedObject(panel);
             pso.FindProperty("source").objectReferenceValue = source;
+            pso.FindProperty("angles").objectReferenceValue = angles;
             pso.FindProperty("label").objectReferenceValue = text;
             pso.ApplyModifiedPropertiesWithoutUndo();
 
